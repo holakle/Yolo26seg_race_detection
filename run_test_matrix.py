@@ -12,6 +12,7 @@ def parse_args():
     p.add_argument("--start-list", default=r"C:\Users\holak\Documents\SAM detection\Startlist input\gold_coast_marathon_2025_results.csv")
     p.add_argument("--ignore-mask", default=r"C:\Users\holak\Documents\SAM detection\yolo26_seg_test\ignore_mask.png")
     p.add_argument("--fps", default="2,3,4,6")
+    p.add_argument("--conf", default="0.25", help="YOLO person detection confidence threshold.")
     p.add_argument("--line", nargs=4, default=["0", "1060", "1920", "1060"])
     p.add_argument("--save-video", action="store_true")
     return p.parse_args()
@@ -41,6 +42,7 @@ def main():
             "--out", str(out),
             "--model", args.model,
             "--imgsz", "1080",
+            "--conf", args.conf,
             "--process-fps", fps,
             "--line", *args.line,
             "--ocr",

@@ -49,6 +49,8 @@ python run_test_matrix.py
 python summarize_tests.py
 ```
 
+Use `python run_test_matrix.py --conf 0.15` to test a lower YOLO person detection threshold. On CPU this can be much slower, so compare `track_crossings.csv` and `suspected_duplicates.csv` before making it a default.
+
 Run a bounded full-video pilot chunk with:
 
 ```powershell
@@ -56,6 +58,16 @@ python run_full_video_chunks.py --max-chunks 1
 ```
 
 The full-video runner uses `--chunk-seconds 300`, `--chunk-overlap-seconds 2`, and `--no-video` by default. It writes chunk folders plus `merged_track_crossings.csv` and `merged_crossings.csv`.
+
+Post-process likely duplicate tracker IDs without changing the raw crossing logs:
+
+```powershell
+python analyze_duplicate_crossings.py `
+  --track-crossings "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\sample_middle_tracker_vs_ocr_3fps_nomask\track_crossings.csv" `
+  --crossings "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\sample_middle_tracker_vs_ocr_3fps_nomask\crossings.csv"
+```
+
+This writes `suspected_duplicates.csv`. It is a review aid: the pipeline still keeps every raw tracker crossing, while this file groups nearby events that look like ID switches or lost-track fallbacks for the same runner.
 
 Result lists are not part of the YOLO/OCR pipeline. Use them only after a run is complete:
 
