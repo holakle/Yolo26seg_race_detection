@@ -1,8 +1,11 @@
 import argparse
 import csv
+import json
 import re
 from collections import Counter
 from pathlib import Path
+
+from common import reference_diff
 
 
 DEFAULT_REFERENCE = "3018,3933,4163,3987,16565,3883,4761,3646,3460,2621,3942,3456,4150,3713,4338,4122,4404,4902,3592,3893,158,4403,3958,4315,3638,3544"
@@ -17,6 +20,14 @@ def parse_args():
 
 
 def read_metrics(log_path):
+    # Prefer the structured metrics.json; fall back to scraping run.log stdout
+    # so older run folders (log only) still summarize.
+    metrics_json = log_path.with_name("metrics.json")
+    if metrics_json.exists():
+        try:
+            return {k: str(v) for k, v in json.loads(metrics_json.read_text(encoding="utf-8")).items()}
+        except (ValueError, OSError):
+            pass
     metrics = {}
     if not log_path.exists():
         return metrics
@@ -26,10 +37,6 @@ def read_metrics(log_path):
             if re.match(r"^[a-z_]+$", key.strip()):
                 metrics[key.strip()] = value.strip()
     return metrics
-
-
-def bib_sequence(rows):
-    return [row.get("matched_bib") or row.get("ocr_digits") for row in rows if row.get("matched_bib") or row.get("ocr_digits")]
 
 
 def main():
@@ -43,9 +50,7 @@ def main():
 
     for csv_path in sorted(root.glob("*/crossings.csv")):
         rows = list(csv.DictReader(csv_path.open(newline="", encoding="utf-8")))
-        preds = bib_sequence(rows)
-        missing = [bib for bib in reference if bib not in preds]
-        extra = [bib for bib in preds if bib not in reference]
+        preds, _, missing, extra = reference_diff(rows, reference)
         missing_counts.update(missing)
         extra_counts.update(extra)
         multi = [row for row in rows if int(row.get("ocr_scanned_count") or 0) > 1]

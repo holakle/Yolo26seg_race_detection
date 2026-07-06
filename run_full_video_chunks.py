@@ -1,8 +1,9 @@
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 import subprocess
 import sys
-from pathlib import Path
 
 import cv2
 
@@ -20,6 +21,11 @@ def parse_args():
     p.add_argument("--max-chunks", type=int, help="Use for pilot/soak tests before the full file.")
     p.add_argument("--line", nargs=4, default=["0", "1060", "1920", "1060"])
     p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True, help="Write MP4 review videos for each chunk.")
+    # Chunks are independent frame ranges, so they parallelize across CPU cores. Keep
+    # workers*threads near the physical core count (6 here) to avoid oversubscribing torch.
+    p.add_argument("--workers", type=int, default=1, help="Chunks to process concurrently.")
+    p.add_argument("--threads", type=int, default=2, help="Torch/OMP threads per chunk worker.")
+    p.add_argument("--db", default="", help="Optional SQLite DB path shared by all chunks.")
     return p.parse_args()
 
 
@@ -33,7 +39,7 @@ def video_meta(path):
     return fps, frames
 
 
-def run_chunk(args, out, start, end):
+def run_chunk(args, index, start, end, out):
     cmd = [
         sys.executable, "yolo26_line_crossing.py",
         "--source", args.source,
@@ -51,10 +57,13 @@ def run_chunk(args, out, start, end):
         "--ocr-fallback-min-digits", "3",
         "--start-list", args.start_list,
         "--device", "cpu",
+        "--threads", str(args.threads),
         "--save-video" if args.save_video else "--no-video",
     ]
     if args.ignore_mask:
         cmd.extend(["--ignore-mask", args.ignore_mask])
+    if args.db:
+        cmd.extend(["--db", args.db])
     with (out / "run.log").open("w", encoding="utf-8") as log:
         return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True).returncode
 
@@ -103,13 +112,27 @@ def main():
         end = min(total_frames, start + chunk_frames)
         out = root / f"chunk_{index:04d}_{start:06d}_{end:06d}"
         out.mkdir(parents=True, exist_ok=True)
-        print(f"running chunk {index}: {start}-{end}")
-        code = run_chunk(args, out, start, end)
-        if code:
-            raise SystemExit(f"chunk {index} failed, see {out / 'run.log'}")
         chunks.append((index, start, end, out))
         start += step
         index += 1
+
+    # Run chunks in a bounded thread pool; each thread just waits on a subprocess.
+    failures = []
+    workers = max(1, args.workers)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {}
+        for chunk in chunks:
+            print(f"queued chunk {chunk[0]}: {chunk[1]}-{chunk[2]}")
+            futures[ex.submit(run_chunk, args, *chunk)] = chunk
+        for fut in as_completed(futures):
+            chunk = futures[fut]
+            code = fut.result()
+            status = "ok" if code == 0 else f"FAILED ({code})"
+            print(f"chunk {chunk[0]} {status}")
+            if code:
+                failures.append(chunk)
+    if failures:
+        raise SystemExit(f"chunks failed: {[c[0] for c in failures]} (see each chunk run.log)")
 
     merged, kept = merge_csv(root, chunks, overlap_frames, "crossings.csv", "merged_crossings.csv")
     merged_tracks, kept_tracks = merge_csv(root, chunks, overlap_frames, "track_crossings.csv", "merged_track_crossings.csv")
@@ -118,6 +141,8 @@ def main():
     print(f"merged_track_crossings: {merged_tracks}")
     print(f"merged_track_rows: {kept_tracks}")
     print(f"chunks: {len(chunks)}")
+    print(f"workers: {workers}")
+    print(f"threads_per_worker: {args.threads}")
 
 
 if __name__ == "__main__":

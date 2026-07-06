@@ -2,12 +2,7 @@ import argparse
 import csv
 from pathlib import Path
 
-
-def as_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+from common import DUPLICATES_HEADER, as_float
 
 
 def load_csv(path):
@@ -160,12 +155,7 @@ def main():
 
     out_path = Path(args.out) if args.out else Path(args.track_crossings).with_name("suspected_duplicates.csv")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "duplicate_group_id", "is_group_representative", "duplicate_score", "duplicate_reason",
-        "track_id", "frame", "time_sec", "direction", "x", "y", "event_source", "candidate_count",
-        "ocr_scanned_count", "ocr_digits", "ocr_score", "matched_bib", "match_type",
-        "match_probability", "annotation_status", "review_reason",
-    ]
+    fieldnames = DUPLICATES_HEADER
 
     with out_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

@@ -1,6 +1,7 @@
 import argparse
 import csv
-import re
+import json
+import os
 import time
 from collections import defaultdict, deque
 from difflib import SequenceMatcher
@@ -9,6 +10,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
+
+import db
+from common import CROSSINGS_HEADER, TRACK_CROSSINGS_HEADER, as_float, digits_only
+from digit_readers import rapidocr_read as read_ocr
 
 
 def side_of_line(point, a, b):
@@ -21,53 +26,64 @@ def distance_to_line(point, a, b):
     return abs(side_of_line(point, a, b)) / length
 
 
-def digits_only(text):
-    return "".join(re.findall(r"\d+", text or ""))
-
-
-def as_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def clear_pngs(path):
     if path.exists():
         for png in path.glob("*.png"):
             png.unlink()
 
 
-def mask_crop(frame, mask, box):
-    # Export a person crop with alpha. Pixels outside the segment are black/transparent.
+class _NullSink:
+    # Stand-in for a csv.writer / file when --no-export-csv is used (DB-only runs).
+    def writerow(self, *args):
+        pass
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def clamp_box(box, width, height):
     x1, y1, x2, y2 = [int(v) for v in box]
-    h, w = frame.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
+    x2, y2 = min(width, x2), min(height, y2)
+    return x1, y1, x2, y2
+
+
+def mask_full(mask_small, width, height):
+    # Upsample the low-res proto mask to full frame. Exact but O(width*height) per person.
+    return cv2.resize(mask_small, (width, height), interpolation=cv2.INTER_NEAREST) > 0.5
+
+
+def mask_local_fast(mask_small, box_i, width, height):
+    # Resize only the bbox region of the proto mask -> O(bbox area). Approximate at
+    # boundaries vs mask_full (A/B-gated by --fast-mask), much cheaper for distant people.
+    x1, y1, x2, y2 = box_i
     if x2 <= x1 or y2 <= y1:
         return None
+    mh, mw = mask_small.shape[:2]
+    sx1, sx2 = int(x1 * mw / width), max(int(x1 * mw / width) + 1, int(round(x2 * mw / width)))
+    sy1, sy2 = int(y1 * mh / height), max(int(y1 * mh / height) + 1, int(round(y2 * mh / height)))
+    sub = mask_small[sy1:sy2, sx1:sx2]
+    if sub.size == 0:
+        return None
+    return cv2.resize(sub, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST) > 0.5
 
+
+def crop_from_local(frame, box_i, mask_local):
+    # Build a BGRA person crop: pixels outside the segment are black/transparent.
+    x1, y1, x2, y2 = box_i
     crop = frame[y1:y2, x1:x2].copy()
-    crop_mask = mask[y1:y2, x1:x2]
-    crop[~crop_mask] = 0
-    alpha = (crop_mask * 255).astype(np.uint8)
+    crop[~mask_local] = 0
+    alpha = (mask_local * 255).astype(np.uint8)
     return np.dstack([crop, alpha])
 
 
-def read_ocr(ocr, crop_bgra, scale):
-    # OCR sees the crop only; final CSV keeps a numeric-only field.
-    image = crop_bgra[:, :, :3] if crop_bgra.shape[2] == 4 else crop_bgra
-    if scale != 1:
-        image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    result = ocr(image)
-
-    texts = [t for t in (result.txts or []) if t]
-    scores = list(result.scores or [])
-    if not texts and result.word_results:
-        texts = [w[0] for w in result.word_results if w and w[0]]
-        scores = [w[1] for w in result.word_results if w and w[0] and len(w) > 1 and w[1] is not None]
-
-    return " ".join(texts), max(scores) if scores else ""
+def materialize_crop(entry):
+    # Lazily build the BGRA crop from a lightweight (frame_i, frame, box_i, mask_local) entry.
+    frame_i, frame, box_i, mask_local = entry
+    return frame_i, crop_from_local(frame, box_i, mask_local)
 
 
 def load_start_list(path):
@@ -172,11 +188,17 @@ def parse_args():
     p.add_argument("--frame-end", type=int, help="Exclusive global source frame to stop at.")
     p.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--fast-mask", action=argparse.BooleanOptionalAction, default=False, help="Resize only the bbox region of each proto mask instead of the full frame. Faster; validate candidate crops match before relying on it.")
+    p.add_argument("--threads", type=int, help="Torch/OMP CPU threads for this process. Keep workers*threads near physical cores when running parallel chunks.")
+    p.add_argument("--ocr-workers", type=int, default=1, help="Parallel worker processes for the deferred OCR phase. Keep at 1 when chunks already run in parallel.")
+    p.add_argument("--db", help="SQLite DB path. When set, run/track/crossing rows are also written to the DB.")
+    p.add_argument("--export-csv", action=argparse.BooleanOptionalAction, default=True, help="Write the CSV outputs (crossings/review/track). Disable to write only the DB.")
     return p.parse_args()
 
 
-def save_and_ocr_event(event, candidate_dir, rows, review_rows, ocr, ocr_scale, fallback_only, fallback_min_digits, fps, start_rows, start_by_bib, accept_score, review_bibs):
+def process_event(event, ocr, candidate_dir, ocr_scale, fallback_only, fallback_min_digits, fps, start_rows, start_by_bib, accept_score, review_bibs):
     # One crossing may have many candidate crops. OCR all, then keep the best numeric read.
+    # Pure compute + PNG export; the caller owns CSV/DB writing so this can run in a worker pool.
     event_dir = candidate_dir / f"id_{event['track_id']:04d}_frame_{event['frame']:06d}"
     event_dir.mkdir(parents=True, exist_ok=True)
 
@@ -241,14 +263,35 @@ def save_and_ocr_event(event, candidate_dir, rows, review_rows, ocr, ocr_scale, 
         status,
         reason,
     ]
-    rows.writerow(row)
-    if status == "review":
-        review_rows.writerow(row)
-    return ocr_ms / 1000, 1 if ocr is not None else 0, match_sec
+    return row, status, ocr_ms / 1000, 1 if ocr is not None else 0, match_sec
+
+
+# --- Deferred-OCR worker plumbing (used only when --ocr-workers > 1) ---
+_WORKER_OCR = None
+_WORKER_CFG = None
+
+
+def _init_ocr_worker(cfg):
+    global _WORKER_OCR, _WORKER_CFG
+    from rapidocr import RapidOCR
+    _WORKER_OCR = RapidOCR()
+    _WORKER_CFG = cfg
+
+
+def _run_event_worker(event):
+    return process_event(event, _WORKER_OCR, **_WORKER_CFG)
 
 
 def main():
     args = parse_args()
+    if args.threads:
+        # Pin CPU threads before torch spins up, so parallel chunk workers don't oversubscribe.
+        os.environ.setdefault("OMP_NUM_THREADS", str(args.threads))
+        try:
+            import torch
+            torch.set_num_threads(args.threads)
+        except ImportError:
+            pass
     total_start = time.perf_counter()
     out = Path(args.out)
     candidate_dir = out / "ocr_candidates"
@@ -279,21 +322,19 @@ def main():
     csv_path = out / "crossings.csv"
     review_path = out / "review.csv"
     track_csv_path = out / "track_crossings.csv"
-    csv_file = csv_path.open("w", newline="", encoding="utf-8")
-    review_file = review_path.open("w", newline="", encoding="utf-8")
-    track_csv_file = track_csv_path.open("w", newline="", encoding="utf-8")
-    rows = csv.writer(csv_file)
-    review_rows = csv.writer(review_file)
-    track_rows = csv.writer(track_csv_file)
-    csv_header = [
-        "track_id", "frame", "time_sec", "direction", "x", "y", "candidate_dir", "candidate_count",
-        "ocr_scanned_count", "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms", "ocr_candidate_reads",
-        "match_type", "matched_bib", "matched_name", "matched_position", "matched_finish_time",
-        "match_probability", "match_candidates", "annotation_status", "review_reason",
-    ]
-    rows.writerow(csv_header)
-    review_rows.writerow(csv_header)
-    track_rows.writerow(["track_id", "frame", "time_sec", "direction", "x", "y", "candidate_count", "event_source"])
+    if args.export_csv:
+        csv_file = csv_path.open("w", newline="", encoding="utf-8")
+        review_file = review_path.open("w", newline="", encoding="utf-8")
+        track_csv_file = track_csv_path.open("w", newline="", encoding="utf-8")
+        rows = csv.writer(csv_file)
+        review_rows = csv.writer(review_file)
+        track_rows = csv.writer(track_csv_file)
+        rows.writerow(CROSSINGS_HEADER)
+        review_rows.writerow(CROSSINGS_HEADER)
+        track_rows.writerow(TRACK_CROSSINGS_HEADER)
+    else:
+        csv_file = review_file = track_csv_file = _NullSink()
+        rows = review_rows = track_rows = _NullSink()
 
     model = YOLO(args.model)
     ocr = None
@@ -302,6 +343,20 @@ def main():
         ocr = RapidOCR()
     start_rows, start_by_bib = load_start_list(args.start_list)
     review_bibs = {digits_only(bib) for bib in args.review_bibs.split(",") if digits_only(bib)}
+
+    # SQLite is the primary store (edge-friendly); CSV export stays on by default so the
+    # existing analysis scripts keep working during the transition.
+    db_conn = None
+    run_id = None
+    if args.db:
+        db_conn = db.connect(args.db)
+        run_id = db.upsert_run(db_conn, out, {
+            "source": args.source, "stride": stride,
+            "frame_start": frame_start, "frame_end": frame_end, "fps": fps,
+        })
+        db.clear_run_rows(db_conn, run_id)
+        if start_rows:
+            db.import_list(db_conn, run_id, start_rows, "start_list")
 
     if args.warmup:
         model.predict(np.zeros((height, width, 3), dtype=np.uint8), imgsz=args.imgsz, device=args.device, verbose=False)
@@ -336,7 +391,7 @@ def main():
     processing_start = time.perf_counter()
 
     def record_track_event(event, source):
-        track_rows.writerow([
+        track_row = [
             event["track_id"],
             event["frame"],
             f"{event['frame'] / fps:.3f}",
@@ -345,8 +400,12 @@ def main():
             event["y"],
             len(event["crops"]),
             source,
-        ])
+        ]
+        track_rows.writerow(track_row)
         track_csv_file.flush()
+        if db_conn is not None:
+            db.insert_track_crossing(db_conn, run_id, track_row)
+            db_conn.commit()
 
     def add_lost_event(track_id):
         side = last_side[track_id]
@@ -359,7 +418,7 @@ def main():
             "direction": "lost_near_line",
             "x": point[0],
             "y": point[1],
-            "crops": list(recent[track_id]),
+            "crops": [materialize_crop(e) for e in recent[track_id]],
             "post_left": 0,
         }
         completed_events.append(event)
@@ -419,7 +478,6 @@ def main():
         seen = set()
 
         for mask_small, box, track_id in zip(masks, boxes, ids):
-            mask = cv2.resize(mask_small, (width, height), interpolation=cv2.INTER_NEAREST) > 0.5
             x1, y1, x2, y2 = box
             point = (int((x1 + x2) / 2), int(y2))
             if ignore_mask is not None and ignore_mask[min(height - 1, max(0, point[1])), min(width - 1, max(0, point[0]))]:
@@ -427,15 +485,31 @@ def main():
             seen.add(track_id)
             missed[track_id] = 0
 
+            box_i = clamp_box(box, width, height)
+            if args.fast_mask:
+                mask_local = mask_local_fast(mask_small, box_i, width, height)
+            else:
+                full = mask_full(mask_small, width, height)
+                bx1, by1, bx2, by2 = box_i
+                mask_local = full[by1:by2, bx1:bx2] if (bx2 > bx1 and by2 > by1) else None
+
             if mask_only is not None:
-                mask_only[mask] = frame[mask]
-            crop = mask_crop(frame, mask, box)
-            if crop is not None:
-                recent[track_id].append((frame_i, crop))
+                if args.fast_mask:
+                    if mask_local is not None:
+                        bx1, by1, bx2, by2 = box_i
+                        mask_only[by1:by2, bx1:bx2][mask_local] = frame[by1:by2, bx1:bx2][mask_local]
+                else:
+                    mask_only[full] = frame[full]
+
+            # Store a lightweight ref; the BGRA crop is materialized only when an event fires.
+            entry = None
+            if mask_local is not None:
+                entry = (frame_i, frame, box_i, mask_local)
+                recent[track_id].append(entry)
 
             # If an ID already crossed, keep a few post-crossing crops before OCR.
-            if track_id in pending and crop is not None and frame_i > pending[track_id]["frame"]:
-                pending[track_id]["crops"].append((frame_i, crop))
+            if track_id in pending and entry is not None and frame_i > pending[track_id]["frame"]:
+                pending[track_id]["crops"].append(materialize_crop(entry))
                 pending[track_id]["post_left"] -= 1
                 if pending[track_id]["post_left"] <= 0:
                     completed_events.append(pending.pop(track_id))
@@ -449,7 +523,7 @@ def main():
                     "direction": direction,
                     "x": point[0],
                     "y": point[1],
-                    "crops": list(recent[track_id]),
+                    "crops": [materialize_crop(e) for e in recent[track_id]],
                     "post_left": args.ocr_post_frames,
                 }
                 pending[track_id] = event
@@ -496,14 +570,43 @@ def main():
     tracking_elapsed = time.perf_counter() - processing_start
 
     # OCR is deferred so the segmentation/tracking path can stay live-oriented.
+    # Events are independent; optionally fan them out across worker processes. The parent
+    # still writes rows in event order (ex.map preserves order) so CSV/DB stay deterministic.
     ocr_start = time.perf_counter()
-    for event in completed_events:
-        ocr_sec, calls, match_sec = save_and_ocr_event(event, candidate_dir, rows, review_rows, ocr, args.ocr_scale, args.ocr_backlog_fallback_only, args.ocr_fallback_min_digits, fps, start_rows, start_by_bib, args.accept_ocr_score, review_bibs)
-        ocr_total += ocr_sec
-        ocr_calls += calls
-        match_total += match_sec
+    cfg = dict(
+        candidate_dir=candidate_dir, ocr_scale=args.ocr_scale,
+        fallback_only=args.ocr_backlog_fallback_only, fallback_min_digits=args.ocr_fallback_min_digits,
+        fps=fps, start_rows=start_rows, start_by_bib=start_by_bib,
+        accept_score=args.accept_ocr_score, review_bibs=review_bibs,
+    )
+
+    def emit(result):
+        row, status, ocr_sec, calls, match_sec = result
+        rows.writerow(row)
+        if status == "review":
+            review_rows.writerow(row)
+        if db_conn is not None:
+            db.insert_crossing(db_conn, run_id, row)
         csv_file.flush()
         review_file.flush()
+        return ocr_sec, calls, match_sec
+
+    if ocr is not None and args.ocr_workers > 1 and len(completed_events) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=args.ocr_workers, initializer=_init_ocr_worker, initargs=(cfg,)) as ex:
+            for result in ex.map(_run_event_worker, completed_events):
+                ocr_sec, calls, match_sec = emit(result)
+                ocr_total += ocr_sec
+                ocr_calls += calls
+                match_total += match_sec
+    else:
+        for event in completed_events:
+            ocr_sec, calls, match_sec = emit(process_event(event, ocr, **cfg))
+            ocr_total += ocr_sec
+            ocr_calls += calls
+            match_total += match_sec
+    if db_conn is not None:
+        db_conn.commit()
     ocr_elapsed = time.perf_counter() - ocr_start
 
     csv_file.close()
@@ -541,6 +644,47 @@ def main():
     if ocr is not None:
         print(f"ocr_calls: {ocr_calls}")
         print(f"ocr_total_sec: {ocr_total:.3f}")
+
+    # Structured metrics so summarize_tests.py no longer needs to scrape stdout.
+    metrics = {
+        "source": args.source,
+        "frame_start": frame_start,
+        "frame_end": frame_end,
+        "stride": stride,
+        "fps": fps,
+        "threads": args.threads or "",
+        "ocr_workers": args.ocr_workers,
+        "fast_mask": args.fast_mask,
+        "processed_frames": processed,
+        "crossing_events": len(completed_events),
+        "source_duration_sec": round(source_duration, 3),
+        "init_sec": round(total_elapsed - tracking_elapsed - ocr_elapsed, 3),
+        "tracking_elapsed_sec": round(tracking_elapsed, 3),
+        "ocr_elapsed_sec": round(ocr_elapsed, 3),
+        "match_elapsed_sec": round(match_total, 3),
+        "total_elapsed_sec": round(total_elapsed, 3),
+        "yolo_preprocess_sec": round(layer["yolo_preprocess"], 3),
+        "yolo_inference_sec": round(layer["yolo_inference"], 3),
+        "yolo_postprocess_sec": round(layer["yolo_postprocess"], 3),
+        "tracking_logic_sec": round(layer["tracking_logic"], 3),
+        "video_write_sec": round(layer["video_write"], 3),
+        "tracking_fps": round(processed / tracking_elapsed if tracking_elapsed else 0, 2),
+        "tracking_real_time_factor": round(source_duration / tracking_elapsed if tracking_elapsed else 0, 2),
+        "total_real_time_factor": round(source_duration / total_elapsed if total_elapsed else 0, 2),
+        "ocr_calls": ocr_calls if ocr is not None else "",
+        "ocr_total_sec": round(ocr_total, 3) if ocr is not None else "",
+    }
+    (out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    if db_conn is not None:
+        db.update_run_metrics(db_conn, run_id, {
+            "tracking_elapsed_sec": round(tracking_elapsed, 3),
+            "ocr_elapsed_sec": round(ocr_elapsed, 3),
+            "total_elapsed_sec": round(total_elapsed, 3),
+            "ocr_calls": ocr_calls if ocr is not None else 0,
+            "crossing_events": len(completed_events),
+        })
+        db_conn.close()
 
 
 if __name__ == "__main__":

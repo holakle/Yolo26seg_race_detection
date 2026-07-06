@@ -1,23 +1,9 @@
 import argparse
 import csv
-import re
 import statistics
 from pathlib import Path
 
-
-def digits_only(text):
-    return "".join(re.findall(r"\d+", text or ""))
-
-
-def finish_time_seconds(value):
-    parts = str(value or "").strip().split(":")
-    if len(parts) != 3:
-        return None
-    try:
-        hours, minutes, seconds = [int(part) for part in parts]
-    except ValueError:
-        return None
-    return hours * 3600 + minutes * 60 + seconds
+from common import ANALYSIS_EXTRA_FIELDS, digits_only, finish_time_seconds
 
 
 def load_results(path):
@@ -57,12 +43,7 @@ def analyze(crossings_path, result_list_path, output_path, window_min):
         )
 
     fieldnames = list(rows[0].keys()) if rows else []
-    for name in [
-        "analysis_result_finish_time",
-        "analysis_result_time_delta_sec",
-        "analysis_result_time_likely",
-        "analysis_result_time_reason",
-    ]:
+    for name in ANALYSIS_EXTRA_FIELDS:
         if name not in fieldnames:
             fieldnames.append(name)
 
