@@ -33,10 +33,14 @@ def clear_pngs(path):
             png.unlink()
 
 
-def mask_crop(frame, mask, box):
+def mask_crop(frame, mask, box, pad=0.0):
     # Export a person crop with alpha. Pixels outside the segment are black/transparent.
     x1, y1, x2, y2 = [int(v) for v in box]
     h, w = frame.shape[:2]
+    pad_x = int((x2 - x1) * pad)
+    pad_y = int((y2 - y1) * pad)
+    x1, y1 = x1 - pad_x, y1 - pad_y
+    x2, y2 = x2 + pad_x, y2 + pad_y
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     if x2 <= x1 or y2 <= y1:
@@ -125,6 +129,7 @@ def parse_args():
     p.add_argument("--ocr-post-frames", type=int, default=3)
     p.add_argument("--ocr-backlog-fallback-only", action=argparse.BooleanOptionalAction, default=False, help="OCR crossing crop first; OCR backlog only if it has fewer than ocr-fallback-min-digits.")
     p.add_argument("--ocr-fallback-min-digits", type=int, default=1, help="With fallback-only OCR, require this many digits before skipping the backlog.")
+    p.add_argument("--crop-pad", type=float, default=0.0, help="Optional padding around YOLO person boxes for saved OCR candidate crops.")
     p.add_argument("--start-list", help="CSV with a bib_number column for OCR result comparison.")
     p.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", default="cpu")
@@ -298,7 +303,7 @@ def main():
                 continue
 
             mask_only[mask] = frame[mask]
-            crop = mask_crop(frame, mask, box)
+            crop = mask_crop(frame, mask, box, args.crop_pad)
             if crop is not None:
                 recent[track_id].append((frame_i, crop))
 

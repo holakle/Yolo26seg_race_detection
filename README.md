@@ -14,22 +14,22 @@ Small local test harness for person segmentation, tracking, virtual line crossin
 
 ```powershell
 python yolo26_line_crossing.py `
-  --source "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\samples\sample_cropped_20s.mp4" `
-  --out "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\line_crossing_2fps_backlog" `
+  --source "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\samples\sample_middle.mp4" `
+  --out "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\line_crossing_middle_1080" `
   --model yolo26n-seg.pt `
-  --imgsz 640 `
-  --process-fps 2 `
-  --line 0 700 1280 700 `
+  --imgsz 1080 `
+  --process-fps 4 `
+  --line 0 1060 1920 1060 `
   --ocr `
   --ocr-pre-frames 3 `
-  --ocr-post-frames 3 `
+  --ocr-post-frames 5 `
   --ocr-backlog-fallback-only `
   --ocr-fallback-min-digits 3 `
   --start-list "C:\Users\holak\Documents\SAM detection\Startlist input\gold_coast_marathon_2025_results.csv" `
   --device cpu
 ```
 
-For a 60 fps source, `--process-fps 2` uses approximately `stride=30`.
+For a 60 fps source, `--process-fps 4` uses approximately `stride=15`.
 
 ## Notes
 
@@ -46,3 +46,5 @@ Future test clips can reuse the same command with:
 ```
 
 `--ocr-backlog-fallback-only` saves the full candidate backlog, but OCRs the crossing crop first and only scans the remaining backlog if that first crop does not meet `--ocr-fallback-min-digits`.
+
+`--crop-pad` can be used for diagnostics if candidate crops look too tight. The default is `0.0` because padding can add distracting pixels and reduce OCR quality.
