@@ -19,7 +19,7 @@ def parse_args():
     p.add_argument("--chunk-overlap-seconds", type=float, default=2)
     p.add_argument("--max-chunks", type=int, help="Use for pilot/soak tests before the full file.")
     p.add_argument("--line", nargs=4, default=["0", "1060", "1920", "1060"])
-    p.add_argument("--save-video", action="store_true")
+    p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True, help="Write MP4 review videos for each chunk.")
     return p.parse_args()
 
 

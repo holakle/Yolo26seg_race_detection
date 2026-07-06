@@ -26,7 +26,6 @@ python yolo26_line_crossing.py `
   --ocr-backlog-fallback-only `
   --ocr-fallback-min-digits 3 `
   --start-list "C:\Users\holak\Documents\SAM detection\Startlist input\gold_coast_marathon_2025_results.csv" `
-  --no-video `
   --device cpu
 ```
 
@@ -49,7 +48,9 @@ python run_test_matrix.py
 python summarize_tests.py
 ```
 
-Use `python run_test_matrix.py --conf 0.15` to test a lower YOLO person detection threshold. On CPU this can be much slower, so compare `track_crossings.csv` and `suspected_duplicates.csv` before making it a default.
+Future runs save the MP4 review video by default. Add `--no-video` only for deliberate low-disk smoke tests.
+
+Keep the YOLO person detection confidence at the default `--conf 0.25` unless there is a specific experiment. In the current `sample_middle.mp4` test, `--conf 0.15` did not reduce lost tracks or duplicate IDs and made CPU tracking much slower.
 
 Run a bounded full-video pilot chunk with:
 
@@ -57,7 +58,7 @@ Run a bounded full-video pilot chunk with:
 python run_full_video_chunks.py --max-chunks 1
 ```
 
-The full-video runner uses `--chunk-seconds 300`, `--chunk-overlap-seconds 2`, and `--no-video` by default. It writes chunk folders plus `merged_track_crossings.csv` and `merged_crossings.csv`.
+The full-video runner uses `--chunk-seconds 300`, `--chunk-overlap-seconds 2`, and saves chunk MP4 review videos by default. It writes chunk folders plus `merged_track_crossings.csv` and `merged_crossings.csv`.
 
 Post-process likely duplicate tracker IDs without changing the raw crossing logs:
 
@@ -68,6 +69,18 @@ python analyze_duplicate_crossings.py `
 ```
 
 This writes `suspected_duplicates.csv`. It is a review aid: the pipeline still keeps every raw tracker crossing, while this file groups nearby events that look like ID switches or lost-track fallbacks for the same runner.
+
+List old generated runs and estimated disk use:
+
+```powershell
+python cleanup_runs.py
+```
+
+Delete matching old runs only after reviewing the list:
+
+```powershell
+python cleanup_runs.py --contains smoke --delete
+```
 
 Result lists are not part of the YOLO/OCR pipeline. Use them only after a run is complete:
 

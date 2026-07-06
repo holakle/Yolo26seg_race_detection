@@ -14,7 +14,7 @@ def parse_args():
     p.add_argument("--fps", default="2,3,4,6")
     p.add_argument("--conf", default="0.25", help="YOLO person detection confidence threshold.")
     p.add_argument("--line", nargs=4, default=["0", "1060", "1920", "1060"])
-    p.add_argument("--save-video", action="store_true")
+    p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True, help="Write MP4 review videos for each run.")
     return p.parse_args()
 
 
