@@ -26,6 +26,7 @@ python yolo26_line_crossing.py `
   --ocr-backlog-fallback-only `
   --ocr-fallback-min-digits 3 `
   --start-list "C:\Users\holak\Documents\SAM detection\Startlist input\gold_coast_marathon_2025_results.csv" `
+  --no-video `
   --device cpu
 ```
 
@@ -38,6 +39,23 @@ Comments in Python code do not add runtime lag. The script keeps comments short 
 Generated outputs, model weights, and videos are ignored by Git. Track source files and docs only.
 
 The final console output prints timing per layer: YOLO preprocess/inference/postprocess, tracking logic, video writing, deferred OCR, and start-list matching.
+
+Every run writes `crossings.csv`; unsure rows are also copied to `review.csv`. Rows are `accepted` only for exact start-list hits with high OCR confidence. Fuzzy, low-confidence, lost-track, short-digit, mismatch, and watchlist bib rows are marked `review`.
+
+Run the short FPS/mask matrix with:
+
+```powershell
+python run_test_matrix.py
+python summarize_tests.py
+```
+
+Run a bounded full-video pilot chunk with:
+
+```powershell
+python run_full_video_chunks.py --max-chunks 1
+```
+
+The full-video runner uses `--chunk-seconds 300`, `--chunk-overlap-seconds 2`, and `--no-video` by default. It writes chunk folders and a merged `merged_crossings.csv`.
 
 Result lists are not part of the YOLO/OCR pipeline. Use them only after a run is complete:
 

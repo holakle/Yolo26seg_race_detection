@@ -123,6 +123,25 @@ def ocr_rank(digits, score, start_by_bib):
     return exact_start_hit, len(digits), score
 
 
+def annotation_status(best, match, event, min_digits, accept_score, review_bibs):
+    match_type, matched_bib = match[0], match[1]
+    score = as_float(best["score"])
+    reasons = []
+    if match_type != "exact":
+        reasons.append("not_exact_match")
+    if best["digits"] != matched_bib:
+        reasons.append("ocr_match_mismatch")
+    if len(best["digits"]) < min_digits:
+        reasons.append("short_digits")
+    if score < accept_score:
+        reasons.append("low_ocr_score")
+    if event["direction"] == "lost_near_line":
+        reasons.append("lost_track_fallback")
+    if matched_bib in review_bibs:
+        reasons.append("watchlist_bib")
+    return ("review", ";".join(reasons)) if reasons else ("accepted", "")
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--source", required=True)
@@ -145,12 +164,18 @@ def parse_args():
     p.add_argument("--lost-track-line-window", type=float, default=40.0, help="Pixel distance from the line used by lost-track-fallback.")
     p.add_argument("--lost-track-miss-frames", type=int, default=2, help="Processed frames a track must be absent before lost-track-fallback fires.")
     p.add_argument("--start-list", help="CSV with a bib_number column for OCR result comparison.")
+    p.add_argument("--accept-ocr-score", type=float, default=0.90)
+    p.add_argument("--review-bibs", default="3544,3460,4315,4761,16565,4163")
+    p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True, help="Write the mask-only review video.")
+    p.add_argument("--no-video", dest="save_video", action="store_false", help="Skip writing the mask-only review video.")
+    p.add_argument("--frame-start", type=int, default=0, help="Global source frame to start from.")
+    p.add_argument("--frame-end", type=int, help="Exclusive global source frame to stop at.")
     p.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
 
-def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only, fallback_min_digits, fps, start_rows, start_by_bib):
+def save_and_ocr_event(event, candidate_dir, rows, review_rows, ocr, ocr_scale, fallback_only, fallback_min_digits, fps, start_rows, start_by_bib, accept_score, review_bibs):
     # One crossing may have many candidate crops. OCR all, then keep the best numeric read.
     event_dir = candidate_dir / f"id_{event['track_id']:04d}_frame_{event['frame']:06d}"
     event_dir.mkdir(parents=True, exist_ok=True)
@@ -158,6 +183,7 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only
     best = {"digits": "", "text": "", "score": "", "crop": "", "rank": (-1, -1, -1.0)}
     ocr_ms = 0.0
     saved = []
+    candidate_reads = []
 
     for frame_i, crop in event["crops"]:
         name = f"id_{event['track_id']:04d}_frame_{frame_i:06d}.png"
@@ -184,6 +210,8 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only
         ocr_scanned += 1
         digits = digits_only(text)
         numeric_score = float(score) if score != "" else 0.0
+        if text or digits:
+            candidate_reads.append(f"{name}:{digits}:{numeric_score:.3f}")
         rank = ocr_rank(digits, numeric_score, start_by_bib)
         if digits and rank > best["rank"]:
             best = {"digits": digits, "text": text, "score": score, "crop": name, "rank": rank}
@@ -191,8 +219,9 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only
     match_start = time.perf_counter()
     match = match_start_list(best["digits"], best["score"], start_rows, start_by_bib)
     match_sec = time.perf_counter() - match_start
+    status, reason = annotation_status(best, match, event, fallback_min_digits, accept_score, review_bibs)
 
-    rows.writerow([
+    row = [
         event["track_id"],
         event["frame"],
         f"{event['frame'] / fps:.3f}",
@@ -207,8 +236,14 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only
         best["digits"],
         best["score"],
         f"{ocr_ms:.1f}" if ocr is not None else "",
+        "|".join(candidate_reads),
         *match,
-    ])
+        status,
+        reason,
+    ]
+    rows.writerow(row)
+    if status == "review":
+        review_rows.writerow(row)
     return ocr_ms / 1000, 1 if ocr is not None else 0, match_sec
 
 
@@ -233,21 +268,28 @@ def main():
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
+    frame_end = min(args.frame_end or total, total)
+    frame_start = max(0, min(args.frame_start, frame_end))
     stride = args.stride or max(1, round(fps / args.process_fps))
     out_fps = max(1, fps / stride)
 
     video_path = out / "mask_only_line_crossing.mp4"
-    writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (width, height))
+    writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (width, height)) if args.save_video else None
 
     csv_path = out / "crossings.csv"
+    review_path = out / "review.csv"
     csv_file = csv_path.open("w", newline="", encoding="utf-8")
+    review_file = review_path.open("w", newline="", encoding="utf-8")
     rows = csv.writer(csv_file)
-    rows.writerow([
+    review_rows = csv.writer(review_file)
+    csv_header = [
         "track_id", "frame", "time_sec", "direction", "x", "y", "candidate_dir", "candidate_count",
-        "ocr_scanned_count", "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms",
+        "ocr_scanned_count", "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms", "ocr_candidate_reads",
         "match_type", "matched_bib", "matched_name", "matched_position", "matched_finish_time",
-        "match_probability", "match_candidates",
-    ])
+        "match_probability", "match_candidates", "annotation_status", "review_reason",
+    ]
+    rows.writerow(csv_header)
+    review_rows.writerow(csv_header)
 
     model = YOLO(args.model)
     ocr = None
@@ -255,6 +297,7 @@ def main():
         from rapidocr import RapidOCR
         ocr = RapidOCR()
     start_rows, start_by_bib = load_start_list(args.start_list)
+    review_bibs = {digits_only(bib) for bib in args.review_bibs.split(",") if digits_only(bib)}
 
     if args.warmup:
         model.predict(np.zeros((height, width, 3), dtype=np.uint8), imgsz=args.imgsz, device=args.device, verbose=False)
@@ -305,26 +348,52 @@ def main():
         crossed.add(track_id)
         return True
 
-    results = model.track(
-        source=args.source,
-        stream=True,
-        vid_stride=stride,
-        persist=True,
-        tracker=args.tracker,
-        classes=[0],
-        conf=args.conf,
-        imgsz=args.imgsz,
-        device=args.device,
-        verbose=False,
-    )
+    def iter_results():
+        if frame_start == 0 and frame_end == total:
+            results = model.track(
+                source=args.source,
+                stream=True,
+                vid_stride=stride,
+                persist=True,
+                tracker=args.tracker,
+                classes=[0],
+                conf=args.conf,
+                imgsz=args.imgsz,
+                device=args.device,
+                verbose=False,
+            )
+            for index, result in enumerate(results):
+                yield result, index * stride
+            return
 
-    for result in results:
+        cap = cv2.VideoCapture(args.source)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
+        frame_i = frame_start
+        while frame_i < frame_end:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if (frame_i - frame_start) % stride == 0:
+                result = model.track(
+                    frame,
+                    persist=True,
+                    tracker=args.tracker,
+                    classes=[0],
+                    conf=args.conf,
+                    imgsz=args.imgsz,
+                    device=args.device,
+                    verbose=False,
+                )[0]
+                yield result, frame_i
+            frame_i += 1
+        cap.release()
+
+    for result, frame_i in iter_results():
         for name, ms in (result.speed or {}).items():
             layer[f"yolo_{name}"] += ms / 1000
         logic_start = time.perf_counter()
         frame = result.orig_img
-        frame_i = processed * stride
-        mask_only = np.zeros_like(frame)
+        mask_only = np.zeros_like(frame) if writer is not None else None
         masks = result.masks.data.cpu().numpy() if result.masks is not None else []
         boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else []
         ids = result.boxes.id.cpu().numpy().astype(int) if result.boxes is not None and result.boxes.id is not None else []
@@ -339,7 +408,8 @@ def main():
             seen.add(track_id)
             missed[track_id] = 0
 
-            mask_only[mask] = frame[mask]
+            if mask_only is not None:
+                mask_only[mask] = frame[mask]
             crop = mask_crop(frame, mask, box)
             if crop is not None:
                 recent[track_id].append((frame_i, crop))
@@ -368,8 +438,9 @@ def main():
             last_side[track_id] = side
             last_point[track_id] = point
             last_frame[track_id] = frame_i
-            cv2.circle(mask_only, point, 4, (0, 255, 255), -1)
-            cv2.putText(mask_only, str(track_id), (int(x1), max(15, int(y1) - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            if mask_only is not None:
+                cv2.circle(mask_only, point, 4, (0, 255, 255), -1)
+                cv2.putText(mask_only, str(track_id), (int(x1), max(15, int(y1) - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         # If a track vanishes near or below the line, keep its backlog instead of losing it.
         if args.lost_track_fallback:
@@ -380,43 +451,51 @@ def main():
                 if missed[track_id] >= args.lost_track_miss_frames:
                     add_lost_event(track_id)
 
-        cv2.line(mask_only, line_a, line_b, (0, 0, 255), 2)
+        if mask_only is not None:
+            cv2.line(mask_only, line_a, line_b, (0, 0, 255), 2)
         layer["tracking_logic"] += time.perf_counter() - logic_start
-        write_start = time.perf_counter()
-        writer.write(mask_only)
-        layer["video_write"] += time.perf_counter() - write_start
+        if writer is not None:
+            write_start = time.perf_counter()
+            writer.write(mask_only)
+            layer["video_write"] += time.perf_counter() - write_start
         processed += 1
         if processed % 25 == 0:
-            print(f"processed {processed} frames, source frame {frame_i}/{total}")
+            print(f"processed {processed} frames, source frame {frame_i}/{frame_end}")
 
     # End-of-file fallback: do not drop crossings just because post frames ran out.
     for event in list(pending.values()):
         completed_events.append(event)
-    if args.lost_track_fallback:
+    if args.lost_track_fallback and frame_end >= total:
         for track_id in list(last_side):
             if track_id not in crossed and track_id not in pending:
                 add_lost_event(track_id)
 
-    writer.release()
+    if writer is not None:
+        writer.release()
     tracking_elapsed = time.perf_counter() - processing_start
 
     # OCR is deferred so the segmentation/tracking path can stay live-oriented.
     ocr_start = time.perf_counter()
     for event in completed_events:
-        ocr_sec, calls, match_sec = save_and_ocr_event(event, candidate_dir, rows, ocr, args.ocr_scale, args.ocr_backlog_fallback_only, args.ocr_fallback_min_digits, fps, start_rows, start_by_bib)
+        ocr_sec, calls, match_sec = save_and_ocr_event(event, candidate_dir, rows, review_rows, ocr, args.ocr_scale, args.ocr_backlog_fallback_only, args.ocr_fallback_min_digits, fps, start_rows, start_by_bib, args.accept_ocr_score, review_bibs)
         ocr_total += ocr_sec
         ocr_calls += calls
         match_total += match_sec
         csv_file.flush()
+        review_file.flush()
     ocr_elapsed = time.perf_counter() - ocr_start
 
     csv_file.close()
+    review_file.close()
     total_elapsed = time.perf_counter() - total_start
-    source_duration = total / fps if fps else 0
+    source_duration = (frame_end - frame_start) / fps if fps else 0
 
-    print(f"video: {video_path}")
+    print(f"video: {video_path if writer is not None else ''}")
     print(f"crossings: {csv_path}")
+    print(f"review: {review_path}")
     print(f"ocr_candidates: {candidate_dir}")
+    print(f"frame_start: {frame_start}")
+    print(f"frame_end: {frame_end}")
     print(f"stride: {stride}")
     print(f"processed_frames: {processed}")
     print(f"crossing_events: {len(completed_events)}")
