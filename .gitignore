@@ -10,3 +10,8 @@ __pycache__/
 yolo26_seg_test/
 Startlist input/
 resultlist input/
+
+# SQLite store (generated) and its WAL sidecars.
+*.db
+*.db-wal
+*.db-shm

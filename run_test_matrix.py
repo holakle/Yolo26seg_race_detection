@@ -1,7 +1,8 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 import subprocess
 import sys
-from pathlib import Path
 
 
 def parse_args():
@@ -15,6 +16,9 @@ def parse_args():
     p.add_argument("--conf", default="0.25", help="YOLO person detection confidence threshold.")
     p.add_argument("--line", nargs=4, default=["0", "1060", "1920", "1060"])
     p.add_argument("--save-video", action=argparse.BooleanOptionalAction, default=True, help="Write MP4 review videos for each run.")
+    # Independent configs parallelize across cores; keep workers*threads near physical cores.
+    p.add_argument("--workers", type=int, default=1, help="Configs to run concurrently.")
+    p.add_argument("--threads", type=int, default=2, help="Torch/OMP threads per config worker.")
     return p.parse_args()
 
 
@@ -23,6 +27,31 @@ def run(cmd, log_path):
     with log_path.open("w", encoding="utf-8") as log:
         proc = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
     return proc.returncode
+
+
+def build_cmd(args, out, fps, mask_path):
+    cmd = [
+        sys.executable, "yolo26_line_crossing.py",
+        "--source", args.source,
+        "--out", str(out),
+        "--model", args.model,
+        "--imgsz", "1080",
+        "--conf", args.conf,
+        "--process-fps", fps,
+        "--line", *args.line,
+        "--ocr",
+        "--ocr-pre-frames", "3",
+        "--ocr-post-frames", "5",
+        "--ocr-backlog-fallback-only",
+        "--ocr-fallback-min-digits", "3",
+        "--start-list", args.start_list,
+        "--device", "cpu",
+        "--threads", str(args.threads),
+        "--save-video" if args.save_video else "--no-video",
+    ]
+    if mask_path:
+        cmd.extend(["--ignore-mask", mask_path])
+    return cmd
 
 
 def main():
@@ -34,35 +63,23 @@ def main():
         configs.append((fps, "nomask", None))
 
     failed = []
-    for fps, mask_name, mask_path in configs:
-        out = root / f"fps{fps}_{mask_name}"
-        cmd = [
-            sys.executable, "yolo26_line_crossing.py",
-            "--source", args.source,
-            "--out", str(out),
-            "--model", args.model,
-            "--imgsz", "1080",
-            "--conf", args.conf,
-            "--process-fps", fps,
-            "--line", *args.line,
-            "--ocr",
-            "--ocr-pre-frames", "3",
-            "--ocr-post-frames", "5",
-            "--ocr-backlog-fallback-only",
-            "--ocr-fallback-min-digits", "3",
-            "--start-list", args.start_list,
-            "--device", "cpu",
-            "--save-video" if args.save_video else "--no-video",
-        ]
-        if mask_path:
-            cmd.extend(["--ignore-mask", mask_path])
-        print(f"running {out.name}")
-        code = run(cmd, out / "run.log")
-        if code:
-            failed.append(out.name)
+    workers = max(1, args.workers)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {}
+        for fps, mask_name, mask_path in configs:
+            out = root / f"fps{fps}_{mask_name}"
+            print(f"queued {out.name}")
+            futures[ex.submit(run, build_cmd(args, out, fps, mask_path), out / "run.log")] = out.name
+        for fut in as_completed(futures):
+            name = futures[fut]
+            code = fut.result()
+            print(f"{name} {'ok' if code == 0 else f'FAILED ({code})'}")
+            if code:
+                failed.append(name)
 
     print(f"matrix_root: {root}")
     print(f"failed: {','.join(failed)}")
+    print(f"workers: {workers}")
     return 1 if failed else 0
 
 

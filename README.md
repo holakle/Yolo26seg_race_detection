@@ -101,3 +101,59 @@ Future test clips can reuse the same command with:
 `--ocr-backlog-fallback-only` saves the full candidate backlog, but OCRs the crossing crop first. It only scans the remaining backlog if that first result has too few digits, or if `--start-list` is present and the digits are not an exact bib-number hit.
 
 `--lost-track-fallback` is enabled by default. If an ID disappears for two processed frames close to or just below the crossing line before a strict crossing is registered, its recent crop backlog is still sent to OCR.
+
+## Install
+
+```powershell
+pip install -r requirements.txt
+```
+
+Shared helpers and the canonical CSV column lists live in `common.py`; every script imports from it instead of re-defining `digits_only` / `as_float` or hardcoding headers.
+
+## Performance flags
+
+Each run writes a structured `metrics.json` beside the CSVs (timings, real-time factors, thread/worker settings); `summarize_tests.py` reads it and falls back to scraping `run.log` for older runs.
+
+- `--threads N` pins torch/OMP CPU threads for the process. On a 6-physical-core box a single stream already uses ~6 threads, so the throughput lever is running independent work in parallel with `--threads` low enough that `workers * threads` stays near the physical core count.
+- `--fast-mask` resizes only each person's bbox region of the segmentation mask instead of the whole frame (much cheaper for distant runners). It differs from the default by <1% of pixels at mask boundaries, so validate candidate crops before relying on it. Default off; the default path keeps the original crop bytes.
+- `--ocr-workers N` fans the deferred OCR phase across worker processes (each builds its own RapidOCR). Keep it at 1 when chunks already run in parallel.
+
+Run the matrix or full-video chunks in parallel (chunks/configs are independent frame ranges):
+
+```powershell
+python run_full_video_chunks.py --workers 3 --threads 2 --max-chunks 1
+python run_test_matrix.py --workers 3 --threads 2
+```
+
+## SQLite store and review UI
+
+SQLite is the primary, edge-friendly store (one embedded file, no server). Pass `--db path\race.db` to the pipeline to write runs, track crossings, and OCR crossings into it alongside the CSVs; `--no-export-csv` writes only the DB. WAL mode plus a busy timeout let parallel chunk workers share one DB file.
+
+Backfill existing run folders (idempotent; preserves any human `verified_bib`):
+
+```powershell
+python ingest_csv_to_db.py --root yolo26_seg_test\test_matrix --db yolo26_seg_test\race.db --start-list "Startlist input\gold_coast_marathon_2025_results.csv"
+```
+
+Review and confirm bibs in a small Streamlit UI (filter to review rows / watchlist, see the segmented candidate crops inline, write `verified_bib`):
+
+```powershell
+streamlit run review_app.py -- --db yolo26_seg_test\race.db
+```
+
+## SVHN digit reader (experimental) and reader benchmark
+
+`digit_readers.py` defines a pluggable `DigitReader.read(crop) -> (text, digits, score, ms)` interface with two backends:
+
+- `rapidocr` — the current production OCR (the pipeline imports its extraction logic, so live behavior is unchanged).
+- `yolo_digits` — the SVHN idea done right: a small YOLO **digit detector** (10 classes, 0-9) finds each digit's box on the masked person crop; boxes are ordered left-to-right and concatenated into the bib. Needs a trained weight — pass `--digit-model`. Source an SVHN-in-YOLO dataset or fine-tune `yolo26n`/`yolo11n` on SVHN full numbers.
+
+Note: `tanganke/clip-vit-base-patch32_svhn` is a whole-image single-digit classifier (no localization), so it cannot read a multi-digit bib on its own. It is exposed only as an optional `ClipSvhnVerifier` to re-score individual digit boxes, off the critical path.
+
+Compare backends on already-saved crops (no YOLO/tracking re-run) for accuracy and per-crop latency:
+
+```powershell
+python benchmark_readers.py --candidates-root yolo26_seg_test\<run>\ocr_candidates --backends rapidocr,yolo_digits --digit-model digits_yolo.pt --nearest-only
+```
+
+This writes `benchmark.csv` and prints a per-backend rollup (ref hits, mean/p50/p95 ms).

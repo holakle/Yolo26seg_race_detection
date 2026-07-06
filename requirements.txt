@@ -1,0 +1,12 @@
+# Core pipeline
+opencv-python
+numpy
+ultralytics          # YOLO26 segmentation/tracking (pulls torch)
+rapidocr             # default bib OCR backend
+
+# Review UI (SQLite store is stdlib sqlite3)
+streamlit
+
+# Optional: only needed for the experimental ClipSvhnVerifier in digit_readers.py
+# transformers
+# torch
