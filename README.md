@@ -46,5 +46,3 @@ Future test clips can reuse the same command with:
 ```
 
 `--ocr-backlog-fallback-only` saves the full candidate backlog, but OCRs the crossing crop first and only scans the remaining backlog if that first crop does not meet `--ocr-fallback-min-digits`.
-
-`--crop-pad` can be used for diagnostics if candidate crops look too tight. The default is `0.0` because padding can add distracting pixels and reduce OCR quality.
