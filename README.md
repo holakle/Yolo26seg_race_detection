@@ -23,6 +23,8 @@ python yolo26_line_crossing.py `
   --ocr `
   --ocr-pre-frames 3 `
   --ocr-post-frames 3 `
+  --ocr-backlog-fallback-only `
+  --ocr-fallback-min-digits 3 `
   --start-list "C:\Users\holak\Documents\SAM detection\Startlist input\gold_coast_marathon_2025_results.csv" `
   --device cpu
 ```
@@ -36,3 +38,11 @@ Comments in Python code do not add runtime lag. The script keeps comments short 
 Generated outputs, model weights, and videos are ignored by Git. Track source files and docs only.
 
 The final console output prints timing per layer: YOLO preprocess/inference/postprocess, tracking logic, video writing, deferred OCR, and start-list matching.
+
+Future test clips can reuse the same command with:
+
+```powershell
+--source "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\samples\sample_middle.mp4"
+```
+
+`--ocr-backlog-fallback-only` saves the full candidate backlog, but OCRs the crossing crop first and only scans the remaining backlog if that first crop does not meet `--ocr-fallback-min-digits`.

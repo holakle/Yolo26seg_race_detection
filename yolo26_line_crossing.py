@@ -123,29 +123,46 @@ def parse_args():
     p.add_argument("--ocr-scale", type=float, default=2.0)
     p.add_argument("--ocr-pre-frames", type=int, default=3)
     p.add_argument("--ocr-post-frames", type=int, default=3)
+    p.add_argument("--ocr-backlog-fallback-only", action=argparse.BooleanOptionalAction, default=False, help="OCR crossing crop first; OCR backlog only if it has fewer than ocr-fallback-min-digits.")
+    p.add_argument("--ocr-fallback-min-digits", type=int, default=1, help="With fallback-only OCR, require this many digits before skipping the backlog.")
     p.add_argument("--start-list", help="CSV with a bib_number column for OCR result comparison.")
     p.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
 
-def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fps, start_rows, start_by_bib):
+def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only, fallback_min_digits, fps, start_rows, start_by_bib):
     # One crossing may have many candidate crops. OCR all, then keep the best numeric read.
     event_dir = candidate_dir / f"id_{event['track_id']:04d}_frame_{event['frame']:06d}"
     event_dir.mkdir(parents=True, exist_ok=True)
 
     best = {"digits": "", "text": "", "score": "", "crop": "", "rank": (-1, -1.0)}
     ocr_ms = 0.0
+    saved = []
 
     for frame_i, crop in event["crops"]:
         name = f"id_{event['track_id']:04d}_frame_{frame_i:06d}.png"
         cv2.imwrite(str(event_dir / name), crop)
+        saved.append((frame_i, name, crop))
+
+    if ocr is not None and saved:
+        crossing = min(saved, key=lambda item: abs(item[0] - event["frame"]))
+        backlog = [item for item in saved if item != crossing]
+        ocr_queue = [crossing] if fallback_only else saved
+        if fallback_only:
+            ocr_queue.extend(backlog)
+
+    ocr_scanned = 0
+    for frame_i, name, crop in ocr_queue if ocr is not None and saved else []:
+        if fallback_only and ocr_scanned > 0 and len(best["digits"]) >= fallback_min_digits:
+            break
         if ocr is None:
             continue
 
         start = time.perf_counter()
         text, score = read_ocr(ocr, crop, ocr_scale)
         ocr_ms += (time.perf_counter() - start) * 1000
+        ocr_scanned += 1
         digits = digits_only(text)
         numeric_score = float(score) if score != "" else 0.0
         rank = (len(digits), numeric_score)
@@ -165,6 +182,7 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fps, start_ro
         event["y"],
         event_dir.name,
         len(event["crops"]),
+        ocr_scanned,
         best["crop"],
         best["text"],
         best["digits"],
@@ -207,7 +225,7 @@ def main():
     rows = csv.writer(csv_file)
     rows.writerow([
         "track_id", "frame", "time_sec", "direction", "x", "y", "candidate_dir", "candidate_count",
-        "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms",
+        "ocr_scanned_count", "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms",
         "match_type", "matched_bib", "matched_name", "matched_position", "matched_finish_time",
         "match_probability", "match_candidates",
     ])
@@ -328,7 +346,7 @@ def main():
     # OCR is deferred so the segmentation/tracking path can stay live-oriented.
     ocr_start = time.perf_counter()
     for event in completed_events:
-        ocr_sec, calls, match_sec = save_and_ocr_event(event, candidate_dir, rows, ocr, args.ocr_scale, fps, start_rows, start_by_bib)
+        ocr_sec, calls, match_sec = save_and_ocr_event(event, candidate_dir, rows, ocr, args.ocr_scale, args.ocr_backlog_fallback_only, args.ocr_fallback_min_digits, fps, start_rows, start_by_bib)
         ocr_total += ocr_sec
         ocr_calls += calls
         match_total += match_sec
