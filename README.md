@@ -23,6 +23,7 @@ python yolo26_line_crossing.py `
   --ocr `
   --ocr-pre-frames 3 `
   --ocr-post-frames 3 `
+  --start-list "C:\Users\holak\Documents\SAM detection\Startlist input\gold_coast_marathon_2025_results.csv" `
   --device cpu
 ```
 
@@ -33,3 +34,5 @@ For a 60 fps source, `--process-fps 2` uses approximately `stride=30`.
 Comments in Python code do not add runtime lag. The script keeps comments short and focused around the tracking, crossing, and OCR backlog logic.
 
 Generated outputs, model weights, and videos are ignored by Git. Track source files and docs only.
+
+The final console output prints timing per layer: YOLO preprocess/inference/postprocess, tracking logic, video writing, deferred OCR, and start-list matching.

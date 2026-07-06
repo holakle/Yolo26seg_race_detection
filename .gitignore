@@ -8,4 +8,5 @@ __pycache__/
 *.avi
 *.mov
 yolo26_seg_test/
-
+Startlist input/
+resultlist input/

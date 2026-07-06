@@ -3,6 +3,7 @@ import csv
 import re
 import time
 from collections import defaultdict, deque
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import cv2
@@ -17,6 +18,13 @@ def side_of_line(point, a, b):
 
 def digits_only(text):
     return "".join(re.findall(r"\d+", text or ""))
+
+
+def as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def clear_pngs(path):
@@ -57,6 +65,48 @@ def read_ocr(ocr, crop_bgra, scale):
     return " ".join(texts), max(scores) if scores else ""
 
 
+def load_start_list(path):
+    if not path:
+        return [], {}
+
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+
+    by_bib = {}
+    for row in rows:
+        bib = digits_only(row.get("bib_number", ""))
+        if bib:
+            by_bib[bib] = row
+    return rows, by_bib
+
+
+def match_start_list(digits, ocr_score, start_rows, start_by_bib):
+    if not digits or not start_by_bib:
+        return "", "", "", "", "", "", ""
+
+    conf = as_float(ocr_score)
+    if digits in start_by_bib:
+        row = start_by_bib[digits]
+        probability = min(0.99, 0.75 + 0.24 * conf)
+        return "exact", digits, row.get("name", ""), row.get("overall_position", ""), row.get("finish_time", ""), f"{probability:.3f}", ""
+
+    candidates = []
+    for row in start_rows:
+        bib = digits_only(row.get("bib_number", ""))
+        if not bib:
+            continue
+        similarity = SequenceMatcher(None, digits, bib).ratio()
+        if digits in bib or bib in digits:
+            similarity = max(similarity, min(len(digits), len(bib)) / max(len(digits), len(bib)))
+        probability = min(0.85, 0.65 * similarity + 0.20 * conf)
+        candidates.append((probability, bib, row))
+
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    probability, bib, row = candidates[0]
+    summary = "; ".join(f"{b}:{r.get('name', '')}:{p:.2f}" for p, b, r in candidates[:3])
+    return "fuzzy", bib, row.get("name", ""), row.get("overall_position", ""), row.get("finish_time", ""), f"{probability:.3f}", summary
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--source", required=True)
@@ -73,12 +123,13 @@ def parse_args():
     p.add_argument("--ocr-scale", type=float, default=2.0)
     p.add_argument("--ocr-pre-frames", type=int, default=3)
     p.add_argument("--ocr-post-frames", type=int, default=3)
+    p.add_argument("--start-list", help="CSV with a bib_number column for OCR result comparison.")
     p.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", default="cpu")
     return p.parse_args()
 
 
-def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fps):
+def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fps, start_rows, start_by_bib):
     # One crossing may have many candidate crops. OCR all, then keep the best numeric read.
     event_dir = candidate_dir / f"id_{event['track_id']:04d}_frame_{event['frame']:06d}"
     event_dir.mkdir(parents=True, exist_ok=True)
@@ -101,6 +152,10 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fps):
         if digits and rank > best["rank"]:
             best = {"digits": digits, "text": text, "score": score, "crop": name, "rank": rank}
 
+    match_start = time.perf_counter()
+    match = match_start_list(best["digits"], best["score"], start_rows, start_by_bib)
+    match_sec = time.perf_counter() - match_start
+
     rows.writerow([
         event["track_id"],
         event["frame"],
@@ -115,8 +170,9 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fps):
         best["digits"],
         best["score"],
         f"{ocr_ms:.1f}" if ocr is not None else "",
+        *match,
     ])
-    return ocr_ms / 1000, 1 if ocr is not None else 0
+    return ocr_ms / 1000, 1 if ocr is not None else 0, match_sec
 
 
 def main():
@@ -149,13 +205,19 @@ def main():
     csv_path = out / "crossings.csv"
     csv_file = csv_path.open("w", newline="", encoding="utf-8")
     rows = csv.writer(csv_file)
-    rows.writerow(["track_id", "frame", "time_sec", "direction", "x", "y", "candidate_dir", "candidate_count", "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms"])
+    rows.writerow([
+        "track_id", "frame", "time_sec", "direction", "x", "y", "candidate_dir", "candidate_count",
+        "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms",
+        "match_type", "matched_bib", "matched_name", "matched_position", "matched_finish_time",
+        "match_probability", "match_candidates",
+    ])
 
     model = YOLO(args.model)
     ocr = None
     if args.ocr:
         from rapidocr import RapidOCR
         ocr = RapidOCR()
+    start_rows, start_by_bib = load_start_list(args.start_list)
 
     if args.warmup:
         model.predict(np.zeros((height, width, 3), dtype=np.uint8), imgsz=args.imgsz, device=args.device, verbose=False)
@@ -182,6 +244,8 @@ def main():
     processed = 0
     ocr_calls = 0
     ocr_total = 0.0
+    match_total = 0.0
+    layer = defaultdict(float)
     processing_start = time.perf_counter()
 
     results = model.track(
@@ -198,6 +262,9 @@ def main():
     )
 
     for result in results:
+        for name, ms in (result.speed or {}).items():
+            layer[f"yolo_{name}"] += ms / 1000
+        logic_start = time.perf_counter()
         frame = result.orig_img
         frame_i = processed * stride
         mask_only = np.zeros_like(frame)
@@ -243,7 +310,10 @@ def main():
             cv2.putText(mask_only, str(track_id), (int(x1), max(15, int(y1) - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         cv2.line(mask_only, line_a, line_b, (0, 0, 255), 2)
+        layer["tracking_logic"] += time.perf_counter() - logic_start
+        write_start = time.perf_counter()
         writer.write(mask_only)
+        layer["video_write"] += time.perf_counter() - write_start
         processed += 1
         if processed % 25 == 0:
             print(f"processed {processed} frames, source frame {frame_i}/{total}")
@@ -258,9 +328,10 @@ def main():
     # OCR is deferred so the segmentation/tracking path can stay live-oriented.
     ocr_start = time.perf_counter()
     for event in completed_events:
-        ocr_sec, calls = save_and_ocr_event(event, candidate_dir, rows, ocr, args.ocr_scale, fps)
+        ocr_sec, calls, match_sec = save_and_ocr_event(event, candidate_dir, rows, ocr, args.ocr_scale, fps, start_rows, start_by_bib)
         ocr_total += ocr_sec
         ocr_calls += calls
+        match_total += match_sec
         csv_file.flush()
     ocr_elapsed = time.perf_counter() - ocr_start
 
@@ -278,7 +349,13 @@ def main():
     print(f"init_sec: {total_elapsed - tracking_elapsed - ocr_elapsed:.3f}")
     print(f"tracking_elapsed_sec: {tracking_elapsed:.3f}")
     print(f"ocr_elapsed_sec: {ocr_elapsed:.3f}")
+    print(f"match_elapsed_sec: {match_total:.3f}")
     print(f"total_elapsed_sec: {total_elapsed:.3f}")
+    print(f"yolo_preprocess_sec: {layer['yolo_preprocess']:.3f}")
+    print(f"yolo_inference_sec: {layer['yolo_inference']:.3f}")
+    print(f"yolo_postprocess_sec: {layer['yolo_postprocess']:.3f}")
+    print(f"tracking_logic_sec: {layer['tracking_logic']:.3f}")
+    print(f"video_write_sec: {layer['video_write']:.3f}")
     print(f"tracking_fps: {processed / tracking_elapsed if tracking_elapsed else 0:.2f}")
     print(f"tracking_real_time_factor: {source_duration / tracking_elapsed if tracking_elapsed else 0:.2f}x")
     print(f"total_real_time_factor: {source_duration / total_elapsed if total_elapsed else 0:.2f}x")
