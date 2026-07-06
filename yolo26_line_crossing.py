@@ -1,7 +1,6 @@
 import argparse
 import csv
 import re
-import statistics
 import time
 from collections import defaultdict, deque
 from difflib import SequenceMatcher
@@ -31,17 +30,6 @@ def as_float(value):
         return float(value)
     except (TypeError, ValueError):
         return 0.0
-
-
-def finish_time_seconds(value):
-    parts = str(value or "").strip().split(":")
-    if len(parts) != 3:
-        return None
-    try:
-        hours, minutes, seconds = [int(part) for part in parts]
-    except ValueError:
-        return None
-    return hours * 3600 + minutes * 60 + seconds
 
 
 def clear_pngs(path):
@@ -97,48 +85,6 @@ def load_start_list(path):
     return rows, by_bib
 
 
-def add_result_time_check(csv_path, result_list_path, window_min):
-    if not result_list_path:
-        return 0.0
-
-    start = time.perf_counter()
-    _, result_by_bib = load_start_list(result_list_path)
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
-
-    checked = []
-    for row in rows:
-        bib = digits_only(row.get("matched_bib") or row.get("ocr_digits"))
-        result = result_by_bib.get(bib, {})
-        finish_time = result.get("finish_time", "")
-        finish_sec = finish_time_seconds(finish_time)
-        row["result_finish_time"] = finish_time
-        row["result_time_delta_sec"] = ""
-        row["result_time_likely"] = ""
-        row["result_time_reason"] = ""
-        if finish_sec is not None:
-            checked.append((row, finish_sec))
-
-    median_sec = statistics.median(finish_sec for _, finish_sec in checked) if checked else None
-    window_sec = window_min * 60
-    for row, finish_sec in checked:
-        delta = finish_sec - median_sec
-        row["result_time_delta_sec"] = f"{delta:.0f}"
-        row["result_time_likely"] = "yes" if abs(delta) <= window_sec else "no"
-        row["result_time_reason"] = f"within {window_min:g} min of clip median" if abs(delta) <= window_sec else f"outside {window_min:g} min of clip median"
-
-    fieldnames = list(rows[0].keys()) if rows else []
-    for name in ["result_finish_time", "result_time_delta_sec", "result_time_likely", "result_time_reason"]:
-        if name not in fieldnames:
-            fieldnames.append(name)
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    return time.perf_counter() - start
-
-
 def match_start_list(digits, ocr_score, start_rows, start_by_bib):
     if not digits or not start_by_bib:
         return "", "", "", "", "", "", ""
@@ -188,8 +134,6 @@ def parse_args():
     p.add_argument("--lost-track-line-window", type=float, default=40.0, help="Pixel distance from the line used by lost-track-fallback.")
     p.add_argument("--lost-track-miss-frames", type=int, default=2, help="Processed frames a track must be absent before lost-track-fallback fires.")
     p.add_argument("--start-list", help="CSV with a bib_number column for OCR result comparison.")
-    p.add_argument("--result-list", help="Post-run results CSV used only to flag whether matched finish times are plausible for this clip.")
-    p.add_argument("--result-time-window-min", type=float, default=5.0, help="Allowed minutes from the detected clip median finish time.")
     p.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", default="cpu")
     return p.parse_args()
@@ -456,7 +400,6 @@ def main():
     ocr_elapsed = time.perf_counter() - ocr_start
 
     csv_file.close()
-    result_check_elapsed = add_result_time_check(csv_path, args.result_list, args.result_time_window_min)
     total_elapsed = time.perf_counter() - total_start
     source_duration = total / fps if fps else 0
 
@@ -471,7 +414,6 @@ def main():
     print(f"tracking_elapsed_sec: {tracking_elapsed:.3f}")
     print(f"ocr_elapsed_sec: {ocr_elapsed:.3f}")
     print(f"match_elapsed_sec: {match_total:.3f}")
-    print(f"result_time_check_sec: {result_check_elapsed:.3f}")
     print(f"total_elapsed_sec: {total_elapsed:.3f}")
     print(f"yolo_preprocess_sec: {layer['yolo_preprocess']:.3f}")
     print(f"yolo_inference_sec: {layer['yolo_inference']:.3f}")

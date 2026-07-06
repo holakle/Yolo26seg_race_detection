@@ -26,7 +26,6 @@ python yolo26_line_crossing.py `
   --ocr-backlog-fallback-only `
   --ocr-fallback-min-digits 3 `
   --start-list "C:\Users\holak\Documents\SAM detection\Startlist input\gold_coast_marathon_2025_results.csv" `
-  --result-list "C:\Users\holak\Documents\SAM detection\resultlist input\gold_coast_marathon_2025_results.csv" `
   --device cpu
 ```
 
@@ -40,7 +39,15 @@ Generated outputs, model weights, and videos are ignored by Git. Track source fi
 
 The final console output prints timing per layer: YOLO preprocess/inference/postprocess, tracking logic, video writing, deferred OCR, and start-list matching.
 
-`--result-list` is used only after OCR is finished. It appends `result_*` columns to `crossings.csv` so obvious finish-time outliers can be reviewed without affecting detection or OCR.
+Result lists are not part of the YOLO/OCR pipeline. Use them only after a run is complete:
+
+```powershell
+python analyze_crossings.py `
+  --crossings "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\line_crossing_middle_1080_img1080_6fps_nomask_lostfallback\crossings.csv" `
+  --result-list "C:\Users\holak\Documents\SAM detection\resultlist input\gold_coast_marathon_2025_results.csv"
+```
+
+This writes `crossings_analysis.csv` beside the original `crossings.csv`.
 
 Future test clips can reuse the same command with:
 
