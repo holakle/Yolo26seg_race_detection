@@ -1,0 +1,293 @@
+import argparse
+import csv
+import re
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+
+def side_of_line(point, a, b):
+    # Signed area: the sign tells which side of the line the point is on.
+    return (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
+
+
+def digits_only(text):
+    return "".join(re.findall(r"\d+", text or ""))
+
+
+def clear_pngs(path):
+    if path.exists():
+        for png in path.glob("*.png"):
+            png.unlink()
+
+
+def mask_crop(frame, mask, box):
+    # Export a person crop with alpha. Pixels outside the segment are black/transparent.
+    x1, y1, x2, y2 = [int(v) for v in box]
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    crop = frame[y1:y2, x1:x2].copy()
+    crop_mask = mask[y1:y2, x1:x2]
+    crop[~crop_mask] = 0
+    alpha = (crop_mask * 255).astype(np.uint8)
+    return np.dstack([crop, alpha])
+
+
+def read_ocr(ocr, crop_bgra, scale):
+    # OCR sees the crop only; final CSV keeps a numeric-only field.
+    image = crop_bgra[:, :, :3] if crop_bgra.shape[2] == 4 else crop_bgra
+    if scale != 1:
+        image = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    result = ocr(image)
+
+    texts = [t for t in (result.txts or []) if t]
+    scores = list(result.scores or [])
+    if not texts and result.word_results:
+        texts = [w[0] for w in result.word_results if w and w[0]]
+        scores = [w[1] for w in result.word_results if w and w[0] and len(w) > 1 and w[1] is not None]
+
+    return " ".join(texts), max(scores) if scores else ""
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--source", required=True)
+    p.add_argument("--out", default="yolo26_seg_test/line_crossing")
+    p.add_argument("--model", default="yolo26n-seg.pt")
+    p.add_argument("--tracker", default="bytetrack.yaml")
+    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--conf", type=float, default=0.25)
+    p.add_argument("--process-fps", type=float, default=2.0, help="Target processed FPS. For 60 fps video, 2 fps becomes stride 30.")
+    p.add_argument("--stride", type=int, help="Override process-fps with an explicit frame stride.")
+    p.add_argument("--line", nargs=4, type=int, metavar=("X1", "Y1", "X2", "Y2"), required=True)
+    p.add_argument("--ignore-mask", help="White-on-black PNG mask. Detections with bottom-center inside white areas are ignored.")
+    p.add_argument("--ocr", action="store_true", help="Run RapidOCR on crossing crop backlogs.")
+    p.add_argument("--ocr-scale", type=float, default=2.0)
+    p.add_argument("--ocr-pre-frames", type=int, default=3)
+    p.add_argument("--ocr-post-frames", type=int, default=3)
+    p.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--device", default="cpu")
+    return p.parse_args()
+
+
+def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fps):
+    # One crossing may have many candidate crops. OCR all, then keep the best numeric read.
+    event_dir = candidate_dir / f"id_{event['track_id']:04d}_frame_{event['frame']:06d}"
+    event_dir.mkdir(parents=True, exist_ok=True)
+
+    best = {"digits": "", "text": "", "score": "", "crop": "", "rank": (-1, -1.0)}
+    ocr_ms = 0.0
+
+    for frame_i, crop in event["crops"]:
+        name = f"id_{event['track_id']:04d}_frame_{frame_i:06d}.png"
+        cv2.imwrite(str(event_dir / name), crop)
+        if ocr is None:
+            continue
+
+        start = time.perf_counter()
+        text, score = read_ocr(ocr, crop, ocr_scale)
+        ocr_ms += (time.perf_counter() - start) * 1000
+        digits = digits_only(text)
+        numeric_score = float(score) if score != "" else 0.0
+        rank = (len(digits), numeric_score)
+        if digits and rank > best["rank"]:
+            best = {"digits": digits, "text": text, "score": score, "crop": name, "rank": rank}
+
+    rows.writerow([
+        event["track_id"],
+        event["frame"],
+        f"{event['frame'] / fps:.3f}",
+        event["direction"],
+        event["x"],
+        event["y"],
+        event_dir.name,
+        len(event["crops"]),
+        best["crop"],
+        best["text"],
+        best["digits"],
+        best["score"],
+        f"{ocr_ms:.1f}" if ocr is not None else "",
+    ])
+    return ocr_ms / 1000, 1 if ocr is not None else 0
+
+
+def main():
+    args = parse_args()
+    total_start = time.perf_counter()
+    out = Path(args.out)
+    candidate_dir = out / "ocr_candidates"
+    out.mkdir(parents=True, exist_ok=True)
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    for child in candidate_dir.glob("*"):
+        if child.is_dir():
+            clear_pngs(child)
+            child.rmdir()
+
+    cap = cv2.VideoCapture(args.source)
+    if not cap.isOpened():
+        raise SystemExit(f"Could not open source: {args.source}")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    stride = args.stride or max(1, round(fps / args.process_fps))
+    out_fps = max(1, fps / stride)
+
+    video_path = out / "mask_only_line_crossing.mp4"
+    writer = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (width, height))
+
+    csv_path = out / "crossings.csv"
+    csv_file = csv_path.open("w", newline="", encoding="utf-8")
+    rows = csv.writer(csv_file)
+    rows.writerow(["track_id", "frame", "time_sec", "direction", "x", "y", "candidate_dir", "candidate_count", "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms"])
+
+    model = YOLO(args.model)
+    ocr = None
+    if args.ocr:
+        from rapidocr import RapidOCR
+        ocr = RapidOCR()
+
+    if args.warmup:
+        model.predict(np.zeros((height, width, 3), dtype=np.uint8), imgsz=args.imgsz, device=args.device, verbose=False)
+        if ocr is not None:
+            ocr(np.zeros((32, 96, 3), dtype=np.uint8))
+
+    line_a = (args.line[0], args.line[1])
+    line_b = (args.line[2], args.line[3])
+    ignore_mask = None
+    if args.ignore_mask:
+        ignore_mask = cv2.imread(args.ignore_mask, cv2.IMREAD_GRAYSCALE)
+        if ignore_mask is None:
+            raise SystemExit(f"Could not read ignore mask: {args.ignore_mask}")
+        if ignore_mask.shape[:2] != (height, width):
+            ignore_mask = cv2.resize(ignore_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        ignore_mask = ignore_mask > 127
+
+    # Per-track state is deliberately small: side, recent crops, and pending OCR events.
+    last_side = {}
+    crossed = set()
+    recent = defaultdict(lambda: deque(maxlen=max(1, args.ocr_pre_frames + 1)))
+    pending = {}
+    completed_events = []
+    processed = 0
+    ocr_calls = 0
+    ocr_total = 0.0
+    processing_start = time.perf_counter()
+
+    results = model.track(
+        source=args.source,
+        stream=True,
+        vid_stride=stride,
+        persist=True,
+        tracker=args.tracker,
+        classes=[0],
+        conf=args.conf,
+        imgsz=args.imgsz,
+        device=args.device,
+        verbose=False,
+    )
+
+    for result in results:
+        frame = result.orig_img
+        frame_i = processed * stride
+        mask_only = np.zeros_like(frame)
+        masks = result.masks.data.cpu().numpy() if result.masks is not None else []
+        boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else []
+        ids = result.boxes.id.cpu().numpy().astype(int) if result.boxes is not None and result.boxes.id is not None else []
+
+        for mask_small, box, track_id in zip(masks, boxes, ids):
+            mask = cv2.resize(mask_small, (width, height), interpolation=cv2.INTER_NEAREST) > 0.5
+            x1, y1, x2, y2 = box
+            point = (int((x1 + x2) / 2), int(y2))
+            if ignore_mask is not None and ignore_mask[min(height - 1, max(0, point[1])), min(width - 1, max(0, point[0]))]:
+                continue
+
+            mask_only[mask] = frame[mask]
+            crop = mask_crop(frame, mask, box)
+            if crop is not None:
+                recent[track_id].append((frame_i, crop))
+
+            # If an ID already crossed, keep a few post-crossing crops before OCR.
+            if track_id in pending and crop is not None and frame_i > pending[track_id]["frame"]:
+                pending[track_id]["crops"].append((frame_i, crop))
+                pending[track_id]["post_left"] -= 1
+                if pending[track_id]["post_left"] <= 0:
+                    completed_events.append(pending.pop(track_id))
+
+            side = side_of_line(point, line_a, line_b)
+            if track_id in last_side and track_id not in crossed and last_side[track_id] * side < 0:
+                direction = "A_to_B" if last_side[track_id] < side else "B_to_A"
+                pending[track_id] = {
+                    "track_id": track_id,
+                    "frame": frame_i,
+                    "direction": direction,
+                    "x": point[0],
+                    "y": point[1],
+                    "crops": list(recent[track_id]),
+                    "post_left": args.ocr_post_frames,
+                }
+                crossed.add(track_id)
+
+            last_side[track_id] = side
+            cv2.circle(mask_only, point, 4, (0, 255, 255), -1)
+            cv2.putText(mask_only, str(track_id), (int(x1), max(15, int(y1) - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        cv2.line(mask_only, line_a, line_b, (0, 0, 255), 2)
+        writer.write(mask_only)
+        processed += 1
+        if processed % 25 == 0:
+            print(f"processed {processed} frames, source frame {frame_i}/{total}")
+
+    # End-of-file fallback: do not drop crossings just because post frames ran out.
+    for event in list(pending.values()):
+        completed_events.append(event)
+
+    writer.release()
+    tracking_elapsed = time.perf_counter() - processing_start
+
+    # OCR is deferred so the segmentation/tracking path can stay live-oriented.
+    ocr_start = time.perf_counter()
+    for event in completed_events:
+        ocr_sec, calls = save_and_ocr_event(event, candidate_dir, rows, ocr, args.ocr_scale, fps)
+        ocr_total += ocr_sec
+        ocr_calls += calls
+        csv_file.flush()
+    ocr_elapsed = time.perf_counter() - ocr_start
+
+    csv_file.close()
+    total_elapsed = time.perf_counter() - total_start
+    source_duration = total / fps if fps else 0
+
+    print(f"video: {video_path}")
+    print(f"crossings: {csv_path}")
+    print(f"ocr_candidates: {candidate_dir}")
+    print(f"stride: {stride}")
+    print(f"processed_frames: {processed}")
+    print(f"crossing_events: {len(completed_events)}")
+    print(f"source_duration_sec: {source_duration:.3f}")
+    print(f"init_sec: {total_elapsed - tracking_elapsed - ocr_elapsed:.3f}")
+    print(f"tracking_elapsed_sec: {tracking_elapsed:.3f}")
+    print(f"ocr_elapsed_sec: {ocr_elapsed:.3f}")
+    print(f"total_elapsed_sec: {total_elapsed:.3f}")
+    print(f"tracking_fps: {processed / tracking_elapsed if tracking_elapsed else 0:.2f}")
+    print(f"tracking_real_time_factor: {source_duration / tracking_elapsed if tracking_elapsed else 0:.2f}x")
+    print(f"total_real_time_factor: {source_duration / total_elapsed if total_elapsed else 0:.2f}x")
+    print(f"live_capable_tracking: {tracking_elapsed < source_duration}")
+    print(f"live_capable_total: {total_elapsed < source_duration}")
+    if ocr is not None:
+        print(f"ocr_calls: {ocr_calls}")
+        print(f"ocr_total_sec: {ocr_total:.3f}")
+
+
+if __name__ == "__main__":
+    main()

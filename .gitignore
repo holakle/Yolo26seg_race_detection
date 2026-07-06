@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+# Local models and generated video/test outputs are too large/noisy for Git.
+*.pt
+*.onnx
+*.mp4
+*.avi
+*.mov
+yolo26_seg_test/
+
