@@ -16,6 +16,11 @@ def side_of_line(point, a, b):
     return (b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])
 
 
+def distance_to_line(point, a, b):
+    length = max(1.0, float(np.hypot(b[0] - a[0], b[1] - a[1])))
+    return abs(side_of_line(point, a, b)) / length
+
+
 def digits_only(text):
     return "".join(re.findall(r"\d+", text or ""))
 
@@ -125,6 +130,9 @@ def parse_args():
     p.add_argument("--ocr-post-frames", type=int, default=3)
     p.add_argument("--ocr-backlog-fallback-only", action=argparse.BooleanOptionalAction, default=False, help="OCR crossing crop first; OCR backlog only if it has fewer than ocr-fallback-min-digits.")
     p.add_argument("--ocr-fallback-min-digits", type=int, default=1, help="With fallback-only OCR, require this many digits before skipping the backlog.")
+    p.add_argument("--lost-track-fallback", action=argparse.BooleanOptionalAction, default=True, help="Create an OCR event when an uncrossed track disappears close to or beyond the line.")
+    p.add_argument("--lost-track-line-window", type=float, default=40.0, help="Pixel distance from the line used by lost-track-fallback.")
+    p.add_argument("--lost-track-miss-frames", type=int, default=2, help="Processed frames a track must be absent before lost-track-fallback fires.")
     p.add_argument("--start-list", help="CSV with a bib_number column for OCR result comparison.")
     p.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--device", default="cpu")
@@ -255,6 +263,9 @@ def main():
 
     # Per-track state is deliberately small: side, recent crops, and pending OCR events.
     last_side = {}
+    last_point = {}
+    last_frame = {}
+    missed = defaultdict(int)
     crossed = set()
     recent = defaultdict(lambda: deque(maxlen=max(1, args.ocr_pre_frames + 1)))
     pending = {}
@@ -265,6 +276,23 @@ def main():
     match_total = 0.0
     layer = defaultdict(float)
     processing_start = time.perf_counter()
+
+    def add_lost_event(track_id):
+        side = last_side[track_id]
+        point = last_point[track_id]
+        if not recent[track_id] or (side < 0 and distance_to_line(point, line_a, line_b) > args.lost_track_line_window):
+            return False
+        completed_events.append({
+            "track_id": track_id,
+            "frame": last_frame[track_id],
+            "direction": "lost_near_line",
+            "x": point[0],
+            "y": point[1],
+            "crops": list(recent[track_id]),
+            "post_left": 0,
+        })
+        crossed.add(track_id)
+        return True
 
     results = model.track(
         source=args.source,
@@ -289,6 +317,7 @@ def main():
         masks = result.masks.data.cpu().numpy() if result.masks is not None else []
         boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else []
         ids = result.boxes.id.cpu().numpy().astype(int) if result.boxes is not None and result.boxes.id is not None else []
+        seen = set()
 
         for mask_small, box, track_id in zip(masks, boxes, ids):
             mask = cv2.resize(mask_small, (width, height), interpolation=cv2.INTER_NEAREST) > 0.5
@@ -296,6 +325,8 @@ def main():
             point = (int((x1 + x2) / 2), int(y2))
             if ignore_mask is not None and ignore_mask[min(height - 1, max(0, point[1])), min(width - 1, max(0, point[0]))]:
                 continue
+            seen.add(track_id)
+            missed[track_id] = 0
 
             mask_only[mask] = frame[mask]
             crop = mask_crop(frame, mask, box)
@@ -324,8 +355,19 @@ def main():
                 crossed.add(track_id)
 
             last_side[track_id] = side
+            last_point[track_id] = point
+            last_frame[track_id] = frame_i
             cv2.circle(mask_only, point, 4, (0, 255, 255), -1)
             cv2.putText(mask_only, str(track_id), (int(x1), max(15, int(y1) - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # If a track vanishes near or below the line, keep its backlog instead of losing it.
+        if args.lost_track_fallback:
+            for track_id in list(last_side):
+                if track_id in seen or track_id in crossed or track_id in pending:
+                    continue
+                missed[track_id] += 1
+                if missed[track_id] >= args.lost_track_miss_frames:
+                    add_lost_event(track_id)
 
         cv2.line(mask_only, line_a, line_b, (0, 0, 255), 2)
         layer["tracking_logic"] += time.perf_counter() - logic_start
@@ -339,6 +381,10 @@ def main():
     # End-of-file fallback: do not drop crossings just because post frames ran out.
     for event in list(pending.values()):
         completed_events.append(event)
+    if args.lost_track_fallback:
+        for track_id in list(last_side):
+            if track_id not in crossed and track_id not in pending:
+                add_lost_event(track_id)
 
     writer.release()
     tracking_elapsed = time.perf_counter() - processing_start

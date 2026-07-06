@@ -46,3 +46,5 @@ Future test clips can reuse the same command with:
 ```
 
 `--ocr-backlog-fallback-only` saves the full candidate backlog, but OCRs the crossing crop first and only scans the remaining backlog if that first crop does not meet `--ocr-fallback-min-digits`.
+
+`--lost-track-fallback` is enabled by default. If an ID disappears for two processed frames close to or just below the crossing line before a strict crossing is registered, its recent crop backlog is still sent to OCR.
