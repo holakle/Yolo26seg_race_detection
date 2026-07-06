@@ -55,6 +55,6 @@ Future test clips can reuse the same command with:
 --source "C:\Users\holak\Documents\SAM detection\yolo26_seg_test\samples\sample_middle.mp4"
 ```
 
-`--ocr-backlog-fallback-only` saves the full candidate backlog, but OCRs the crossing crop first and only scans the remaining backlog if that first crop does not meet `--ocr-fallback-min-digits`.
+`--ocr-backlog-fallback-only` saves the full candidate backlog, but OCRs the crossing crop first. It only scans the remaining backlog if that first result has too few digits, or if `--start-list` is present and the digits are not an exact bib-number hit.
 
 `--lost-track-fallback` is enabled by default. If an ID disappears for two processed frames close to or just below the crossing line before a strict crossing is registered, its recent crop backlog is still sent to OCR.

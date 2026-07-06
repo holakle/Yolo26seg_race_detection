@@ -112,6 +112,17 @@ def match_start_list(digits, ocr_score, start_rows, start_by_bib):
     return "fuzzy", bib, row.get("name", ""), row.get("overall_position", ""), row.get("finish_time", ""), f"{probability:.3f}", summary
 
 
+def fallback_result_ok(digits, min_digits, start_by_bib):
+    if len(digits) < min_digits:
+        return False
+    return not start_by_bib or digits in start_by_bib
+
+
+def ocr_rank(digits, score, start_by_bib):
+    exact_start_hit = 1 if start_by_bib and digits in start_by_bib else 0
+    return exact_start_hit, len(digits), score
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--source", required=True)
@@ -128,7 +139,7 @@ def parse_args():
     p.add_argument("--ocr-scale", type=float, default=2.0)
     p.add_argument("--ocr-pre-frames", type=int, default=3)
     p.add_argument("--ocr-post-frames", type=int, default=3)
-    p.add_argument("--ocr-backlog-fallback-only", action=argparse.BooleanOptionalAction, default=False, help="OCR crossing crop first; OCR backlog only if it has fewer than ocr-fallback-min-digits.")
+    p.add_argument("--ocr-backlog-fallback-only", action=argparse.BooleanOptionalAction, default=False, help="OCR crossing crop first; scan backlog only if the first result is weak or not in start-list.")
     p.add_argument("--ocr-fallback-min-digits", type=int, default=1, help="With fallback-only OCR, require this many digits before skipping the backlog.")
     p.add_argument("--lost-track-fallback", action=argparse.BooleanOptionalAction, default=True, help="Create an OCR event when an uncrossed track disappears close to or beyond the line.")
     p.add_argument("--lost-track-line-window", type=float, default=40.0, help="Pixel distance from the line used by lost-track-fallback.")
@@ -144,7 +155,7 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only
     event_dir = candidate_dir / f"id_{event['track_id']:04d}_frame_{event['frame']:06d}"
     event_dir.mkdir(parents=True, exist_ok=True)
 
-    best = {"digits": "", "text": "", "score": "", "crop": "", "rank": (-1, -1.0)}
+    best = {"digits": "", "text": "", "score": "", "crop": "", "rank": (-1, -1, -1.0)}
     ocr_ms = 0.0
     saved = []
 
@@ -162,7 +173,7 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only
 
     ocr_scanned = 0
     for frame_i, name, crop in ocr_queue if ocr is not None and saved else []:
-        if fallback_only and ocr_scanned > 0 and len(best["digits"]) >= fallback_min_digits:
+        if fallback_only and ocr_scanned > 0 and fallback_result_ok(best["digits"], fallback_min_digits, start_by_bib):
             break
         if ocr is None:
             continue
@@ -173,7 +184,7 @@ def save_and_ocr_event(event, candidate_dir, rows, ocr, ocr_scale, fallback_only
         ocr_scanned += 1
         digits = digits_only(text)
         numeric_score = float(score) if score != "" else 0.0
-        rank = (len(digits), numeric_score)
+        rank = ocr_rank(digits, numeric_score, start_by_bib)
         if digits and rank > best["rank"]:
             best = {"digits": digits, "text": text, "score": score, "crop": name, "rank": rank}
 
