@@ -40,7 +40,7 @@ Generated outputs, model weights, and videos are ignored by Git. Track source fi
 
 The final console output prints timing per layer: YOLO preprocess/inference/postprocess, tracking logic, video writing, deferred OCR, and start-list matching.
 
-Every run writes `crossings.csv`; unsure rows are also copied to `review.csv`. Rows are `accepted` only for exact start-list hits with high OCR confidence. Fuzzy, low-confidence, lost-track, short-digit, mismatch, and watchlist bib rows are marked `review`.
+Every run writes `track_crossings.csv` immediately when a track crosses or triggers the lost-track fallback. That file is the all-detected-ID passing-time log and does not depend on OCR. `crossings.csv` is the OCR-enriched event file; unsure OCR rows are also copied to `review.csv`. Rows are `accepted` only for exact start-list hits with high OCR confidence. Fuzzy, low-confidence, lost-track, short-digit, mismatch, and watchlist bib rows are marked `review`.
 
 Run the short FPS/mask matrix with:
 
@@ -55,7 +55,7 @@ Run a bounded full-video pilot chunk with:
 python run_full_video_chunks.py --max-chunks 1
 ```
 
-The full-video runner uses `--chunk-seconds 300`, `--chunk-overlap-seconds 2`, and `--no-video` by default. It writes chunk folders and a merged `merged_crossings.csv`.
+The full-video runner uses `--chunk-seconds 300`, `--chunk-overlap-seconds 2`, and `--no-video` by default. It writes chunk folders plus `merged_track_crossings.csv` and `merged_crossings.csv`.
 
 Result lists are not part of the YOLO/OCR pipeline. Use them only after a run is complete:
 

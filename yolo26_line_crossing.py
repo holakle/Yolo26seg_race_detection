@@ -278,10 +278,13 @@ def main():
 
     csv_path = out / "crossings.csv"
     review_path = out / "review.csv"
+    track_csv_path = out / "track_crossings.csv"
     csv_file = csv_path.open("w", newline="", encoding="utf-8")
     review_file = review_path.open("w", newline="", encoding="utf-8")
+    track_csv_file = track_csv_path.open("w", newline="", encoding="utf-8")
     rows = csv.writer(csv_file)
     review_rows = csv.writer(review_file)
+    track_rows = csv.writer(track_csv_file)
     csv_header = [
         "track_id", "frame", "time_sec", "direction", "x", "y", "candidate_dir", "candidate_count",
         "ocr_scanned_count", "best_crop", "ocr_text", "ocr_digits", "ocr_score", "ocr_ms", "ocr_candidate_reads",
@@ -290,6 +293,7 @@ def main():
     ]
     rows.writerow(csv_header)
     review_rows.writerow(csv_header)
+    track_rows.writerow(["track_id", "frame", "time_sec", "direction", "x", "y", "candidate_count", "event_source"])
 
     model = YOLO(args.model)
     ocr = None
@@ -331,12 +335,25 @@ def main():
     layer = defaultdict(float)
     processing_start = time.perf_counter()
 
+    def record_track_event(event, source):
+        track_rows.writerow([
+            event["track_id"],
+            event["frame"],
+            f"{event['frame'] / fps:.3f}",
+            event["direction"],
+            event["x"],
+            event["y"],
+            len(event["crops"]),
+            source,
+        ])
+        track_csv_file.flush()
+
     def add_lost_event(track_id):
         side = last_side[track_id]
         point = last_point[track_id]
         if not recent[track_id] or (side < 0 and distance_to_line(point, line_a, line_b) > args.lost_track_line_window):
             return False
-        completed_events.append({
+        event = {
             "track_id": track_id,
             "frame": last_frame[track_id],
             "direction": "lost_near_line",
@@ -344,7 +361,9 @@ def main():
             "y": point[1],
             "crops": list(recent[track_id]),
             "post_left": 0,
-        })
+        }
+        completed_events.append(event)
+        record_track_event(event, "lost_track_fallback")
         crossed.add(track_id)
         return True
 
@@ -424,7 +443,7 @@ def main():
             side = side_of_line(point, line_a, line_b)
             if track_id in last_side and track_id not in crossed and last_side[track_id] * side < 0:
                 direction = "A_to_B" if last_side[track_id] < side else "B_to_A"
-                pending[track_id] = {
+                event = {
                     "track_id": track_id,
                     "frame": frame_i,
                     "direction": direction,
@@ -433,6 +452,8 @@ def main():
                     "crops": list(recent[track_id]),
                     "post_left": args.ocr_post_frames,
                 }
+                pending[track_id] = event
+                record_track_event(event, "line_crossing")
                 crossed.add(track_id)
 
             last_side[track_id] = side
@@ -487,12 +508,14 @@ def main():
 
     csv_file.close()
     review_file.close()
+    track_csv_file.close()
     total_elapsed = time.perf_counter() - total_start
     source_duration = (frame_end - frame_start) / fps if fps else 0
 
     print(f"video: {video_path if writer is not None else ''}")
     print(f"crossings: {csv_path}")
     print(f"review: {review_path}")
+    print(f"track_crossings: {track_csv_path}")
     print(f"ocr_candidates: {candidate_dir}")
     print(f"frame_start: {frame_start}")
     print(f"frame_end: {frame_end}")

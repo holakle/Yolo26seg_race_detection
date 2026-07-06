@@ -59,14 +59,14 @@ def run_chunk(args, out, start, end):
         return subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, text=True).returncode
 
 
-def merge_chunks(root, chunks, overlap_frames):
-    merged = root / "merged_crossings.csv"
+def merge_csv(root, chunks, overlap_frames, source_name, merged_name):
+    merged = root / merged_name
     fieldnames = None
     kept = 0
     with merged.open("w", newline="", encoding="utf-8") as f:
         writer = None
         for index, start, end, out in chunks:
-            csv_path = out / "crossings.csv"
+            csv_path = out / source_name
             if not csv_path.exists():
                 continue
             reader = csv.DictReader(csv_path.open(newline="", encoding="utf-8"))
@@ -111,9 +111,12 @@ def main():
         start += step
         index += 1
 
-    merged, kept = merge_chunks(root, chunks, overlap_frames)
+    merged, kept = merge_csv(root, chunks, overlap_frames, "crossings.csv", "merged_crossings.csv")
+    merged_tracks, kept_tracks = merge_csv(root, chunks, overlap_frames, "track_crossings.csv", "merged_track_crossings.csv")
     print(f"merged_crossings: {merged}")
     print(f"merged_rows: {kept}")
+    print(f"merged_track_crossings: {merged_tracks}")
+    print(f"merged_track_rows: {kept_tracks}")
     print(f"chunks: {len(chunks)}")
 
 
